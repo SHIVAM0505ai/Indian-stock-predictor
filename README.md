@@ -46,6 +46,7 @@ indian-stock-predictor/
 ├── data_fetcher.py    # Live data + 15+ technical indicators
 ├── model_trainer.py   # XGBoost + RF + GB ensemble ML models
 ├── requirements.txt   # Python dependencies
+LICENSE
 └── README.md          # This file
 ```
 
