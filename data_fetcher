@@ -1,0 +1,471 @@
+"""
+Data Fetcher - Live NSE data with 15+ technical indicators
+Uses yfinance for data, pandas-ta for indicators
+"""
+
+import yfinance as yf
+import pandas as pd
+import numpy as np
+from datetime import datetime, timedelta
+import streamlit as st
+import warnings
+warnings.filterwarnings('ignore')
+
+# Cache timeout in seconds
+CACHE_TTL = 300  # 5 minutes
+
+@st.cache_data(ttl=CACHE_TTL)
+def fetch_stock_data(symbol: str, period: str = "6mo", interval: str = "1d") -> pd.DataFrame:
+    """
+    Fetch OHLCV data for a given NSE stock symbol.
+    
+    Args:
+        symbol: NSE symbol (e.g., 'RELIANCE.NS')
+        period: Data period ('1mo', '3mo', '6mo', '1y', '2y', '5y')
+        interval: Data interval ('1d', '1wk', '1mo')
+    
+    Returns:
+        DataFrame with OHLCV data + technical indicators
+    """
+    try:
+        ticker = yf.Ticker(symbol)
+        df = ticker.history(period=period, interval=interval)
+        
+        if df.empty:
+            return pd.DataFrame()
+        
+        # Clean column names
+        df.columns = [c.lower() for c in df.columns]
+        df.index = pd.to_datetime(df.index)
+        df = df.dropna()
+        
+        # Add technical indicators
+        df = add_technical_indicators(df)
+        
+        return df
+    except Exception as e:
+        st.error(f"Error fetching data for {symbol}: {e}")
+        return pd.DataFrame()
+
+
+@st.cache_data(ttl=CACHE_TTL)
+def fetch_stock_info(symbol: str) -> dict:
+    """Fetch stock metadata and fundamentals"""
+    try:
+        ticker = yf.Ticker(symbol)
+        info = ticker.info
+        
+        return {
+            "name": info.get("longName", info.get("shortName", symbol)),
+            "sector": info.get("sector", "N/A"),
+            "industry": info.get("industry", "N/A"),
+            "market_cap": info.get("marketCap", 0),
+            "pe_ratio": info.get("trailingPE", None),
+            "pb_ratio": info.get("priceToBook", None),
+            "dividend_yield": info.get("dividendYield", None),
+            "52w_high": info.get("fiftyTwoWeekHigh", None),
+            "52w_low": info.get("fiftyTwoWeekLow", None),
+            "avg_volume": info.get("averageVolume", None),
+            "beta": info.get("beta", None),
+            "eps": info.get("trailingEps", None),
+            "revenue": info.get("totalRevenue", None),
+            "profit_margin": info.get("profitMargins", None),
+            "roe": info.get("returnOnEquity", None),
+            "debt_to_equity": info.get("debtToEquity", None),
+            "current_ratio": info.get("currentRatio", None),
+            "description": info.get("longBusinessSummary", ""),
+            "website": info.get("website", ""),
+            "employees": info.get("fullTimeEmployees", None),
+        }
+    except Exception:
+        return {}
+
+
+@st.cache_data(ttl=60)  # 1 minute for live prices
+def fetch_current_price(symbol: str) -> dict:
+    """Fetch current live price data"""
+    try:
+        ticker = yf.Ticker(symbol)
+        info = ticker.info
+        
+        current_price = info.get("currentPrice") or info.get("regularMarketPrice", 0)
+        prev_close = info.get("regularMarketPreviousClose", current_price)
+        
+        change = current_price - prev_close if prev_close else 0
+        change_pct = (change / prev_close * 100) if prev_close else 0
+        
+        return {
+            "price": current_price,
+            "prev_close": prev_close,
+            "change": change,
+            "change_pct": change_pct,
+            "open": info.get("regularMarketOpen", current_price),
+            "high": info.get("regularMarketDayHigh", current_price),
+            "low": info.get("regularMarketDayLow", current_price),
+            "volume": info.get("regularMarketVolume", 0),
+            "market_cap": info.get("marketCap", 0),
+        }
+    except Exception:
+        return {"price": 0, "change": 0, "change_pct": 0}
+
+
+@st.cache_data(ttl=60)
+def fetch_index_data(symbols: list) -> dict:
+    """Fetch data for market indices"""
+    results = {}
+    for symbol in symbols:
+        try:
+            ticker = yf.Ticker(symbol)
+            info = ticker.info
+            
+            price = info.get("regularMarketPrice", 0) or info.get("currentPrice", 0)
+            prev = info.get("regularMarketPreviousClose", price)
+            change_pct = ((price - prev) / prev * 100) if prev else 0
+            
+            results[symbol] = {
+                "price": price,
+                "change_pct": change_pct,
+                "change": price - prev,
+            }
+        except Exception:
+            results[symbol] = {"price": 0, "change_pct": 0, "change": 0}
+    
+    return results
+
+
+def add_technical_indicators(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Add 15+ technical indicators to the DataFrame.
+    Uses pandas-ta library with fallback manual calculations.
+    """
+    if df.empty or len(df) < 20:
+        return df
+    
+    try:
+        import pandas_ta as ta
+        
+        # Momentum Indicators
+        # RSI (14)
+        df['rsi'] = ta.rsi(df['close'], length=14)
+        
+        # MACD
+        macd = ta.macd(df['close'], fast=12, slow=26, signal=9)
+        if macd is not None and not macd.empty:
+            df['macd'] = macd.iloc[:, 0]
+            df['macd_signal'] = macd.iloc[:, 1]
+            df['macd_hist'] = macd.iloc[:, 2]
+        
+        # Stochastic Oscillator
+        stoch = ta.stoch(df['high'], df['low'], df['close'])
+        if stoch is not None and not stoch.empty:
+            df['stoch_k'] = stoch.iloc[:, 0]
+            df['stoch_d'] = stoch.iloc[:, 1]
+        
+        # Williams %R
+        df['williams_r'] = ta.willr(df['high'], df['low'], df['close'])
+        
+        # Momentum
+        df['momentum'] = ta.mom(df['close'], length=10)
+        
+        # Rate of Change
+        df['roc'] = ta.roc(df['close'], length=10)
+        
+        # Trend Indicators
+        # Simple Moving Averages
+        df['sma_20'] = ta.sma(df['close'], length=20)
+        df['sma_50'] = ta.sma(df['close'], length=50)
+        df['sma_200'] = ta.sma(df['close'], length=200)
+        
+        # Exponential Moving Averages
+        df['ema_9'] = ta.ema(df['close'], length=9)
+        df['ema_21'] = ta.ema(df['close'], length=21)
+        df['ema_50'] = ta.ema(df['close'], length=50)
+        
+        # Volatility Indicators
+        # Bollinger Bands
+        bb = ta.bbands(df['close'], length=20, std=2)
+        if bb is not None and not bb.empty:
+            df['bb_upper'] = bb.iloc[:, 0]
+            df['bb_mid'] = bb.iloc[:, 1]
+            df['bb_lower'] = bb.iloc[:, 2]
+            df['bb_width'] = (df['bb_upper'] - df['bb_lower']) / df['bb_mid']
+        
+        # ATR (Average True Range)
+        df['atr'] = ta.atr(df['high'], df['low'], df['close'], length=14)
+        
+        # Volume Indicators
+        # OBV (On Balance Volume)
+        df['obv'] = ta.obv(df['close'], df['volume'])
+        
+        # Volume SMA
+        df['vol_sma_20'] = ta.sma(df['volume'], length=20)
+        
+        # Additional Derived Features
+        df['price_change'] = df['close'].pct_change()
+        df['price_change_5d'] = df['close'].pct_change(5)
+        df['price_change_20d'] = df['close'].pct_change(20)
+        df['high_low_range'] = (df['high'] - df['low']) / df['close']
+        df['volume_ratio'] = df['volume'] / df['vol_sma_20']
+        
+        # Support and Resistance (Pivot Points)
+        df['pivot'] = (df['high'].shift(1) + df['low'].shift(1) + df['close'].shift(1)) / 3
+        df['resistance1'] = 2 * df['pivot'] - df['low'].shift(1)
+        df['support1'] = 2 * df['pivot'] - df['high'].shift(1)
+        df['resistance2'] = df['pivot'] + (df['high'].shift(1) - df['low'].shift(1))
+        df['support2'] = df['pivot'] - (df['high'].shift(1) - df['low'].shift(1))
+        
+    except ImportError:
+        # Fallback manual calculations if pandas-ta not available
+        df = add_indicators_manual(df)
+    except Exception as e:
+        df = add_indicators_manual(df)
+    
+    return df
+
+
+def add_indicators_manual(df: pd.DataFrame) -> pd.DataFrame:
+    """Manual calculation of technical indicators as fallback"""
+    
+    close = df['close']
+    high = df['high']
+    low = df['low']
+    volume = df['volume']
+    
+    # RSI
+    delta = close.diff()
+    gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
+    loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
+    rs = gain / loss
+    df['rsi'] = 100 - (100 / (1 + rs))
+    
+    # MACD
+    ema12 = close.ewm(span=12, adjust=False).mean()
+    ema26 = close.ewm(span=26, adjust=False).mean()
+    df['macd'] = ema12 - ema26
+    df['macd_signal'] = df['macd'].ewm(span=9, adjust=False).mean()
+    df['macd_hist'] = df['macd'] - df['macd_signal']
+    
+    # Moving Averages
+    df['sma_20'] = close.rolling(20).mean()
+    df['sma_50'] = close.rolling(50).mean()
+    df['sma_200'] = close.rolling(200).mean()
+    df['ema_9'] = close.ewm(span=9, adjust=False).mean()
+    df['ema_21'] = close.ewm(span=21, adjust=False).mean()
+    df['ema_50'] = close.ewm(span=50, adjust=False).mean()
+    
+    # Bollinger Bands
+    df['bb_mid'] = close.rolling(20).mean()
+    bb_std = close.rolling(20).std()
+    df['bb_upper'] = df['bb_mid'] + 2 * bb_std
+    df['bb_lower'] = df['bb_mid'] - 2 * bb_std
+    df['bb_width'] = (df['bb_upper'] - df['bb_lower']) / df['bb_mid']
+    
+    # ATR
+    tr1 = high - low
+    tr2 = abs(high - close.shift())
+    tr3 = abs(low - close.shift())
+    tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+    df['atr'] = tr.rolling(14).mean()
+    
+    # Momentum
+    df['momentum'] = close - close.shift(10)
+    df['roc'] = close.pct_change(10) * 100
+    
+    # Stochastic
+    low14 = low.rolling(14).min()
+    high14 = high.rolling(14).max()
+    df['stoch_k'] = 100 * (close - low14) / (high14 - low14)
+    df['stoch_d'] = df['stoch_k'].rolling(3).mean()
+    
+    # Volume
+    df['vol_sma_20'] = volume.rolling(20).mean()
+    df['volume_ratio'] = volume / df['vol_sma_20']
+    
+    # OBV
+    obv = [0]
+    for i in range(1, len(close)):
+        if close.iloc[i] > close.iloc[i-1]:
+            obv.append(obv[-1] + volume.iloc[i])
+        elif close.iloc[i] < close.iloc[i-1]:
+            obv.append(obv[-1] - volume.iloc[i])
+        else:
+            obv.append(obv[-1])
+    df['obv'] = obv
+    
+    # Derived
+    df['price_change'] = close.pct_change()
+    df['price_change_5d'] = close.pct_change(5)
+    df['price_change_20d'] = close.pct_change(20)
+    df['high_low_range'] = (high - low) / close
+    
+    # Pivot Points
+    df['pivot'] = (high.shift(1) + low.shift(1) + close.shift(1)) / 3
+    df['resistance1'] = 2 * df['pivot'] - low.shift(1)
+    df['support1'] = 2 * df['pivot'] - high.shift(1)
+    df['resistance2'] = df['pivot'] + (high.shift(1) - low.shift(1))
+    df['support2'] = df['pivot'] - (high.shift(1) - low.shift(1))
+    
+    return df
+
+
+def get_signal_strength(df: pd.DataFrame) -> dict:
+    """
+    Analyze technical indicators and generate buy/sell signals.
+    Returns a dict with signal counts and overall recommendation.
+    """
+    if df.empty:
+        return {"recommendation": "N/A", "buy_signals": 0, "sell_signals": 0, "neutral_signals": 0}
+    
+    last = df.iloc[-1]
+    buy_signals = 0
+    sell_signals = 0
+    neutral_signals = 0
+    signal_details = []
+    
+    # RSI Analysis
+    if 'rsi' in df.columns and not pd.isna(last.get('rsi')):
+        rsi = last['rsi']
+        if rsi < 30:
+            buy_signals += 2
+            signal_details.append(("RSI", f"{rsi:.1f}", "OVERSOLD - BUY", "buy"))
+        elif rsi > 70:
+            sell_signals += 2
+            signal_details.append(("RSI", f"{rsi:.1f}", "OVERBOUGHT - SELL", "sell"))
+        elif rsi > 50:
+            buy_signals += 1
+            signal_details.append(("RSI", f"{rsi:.1f}", "Bullish momentum", "buy"))
+        else:
+            sell_signals += 1
+            signal_details.append(("RSI", f"{rsi:.1f}", "Bearish momentum", "sell"))
+    
+    # MACD Analysis
+    if 'macd' in df.columns and 'macd_signal' in df.columns:
+        macd = last.get('macd', 0)
+        signal = last.get('macd_signal', 0)
+        hist = last.get('macd_hist', 0)
+        
+        if not pd.isna(macd) and not pd.isna(signal):
+            if macd > signal and hist > 0:
+                buy_signals += 2
+                signal_details.append(("MACD", f"{macd:.2f}", "Bullish crossover", "buy"))
+            elif macd < signal and hist < 0:
+                sell_signals += 2
+                signal_details.append(("MACD", f"{macd:.2f}", "Bearish crossover", "sell"))
+            else:
+                neutral_signals += 1
+                signal_details.append(("MACD", f"{macd:.2f}", "Neutral", "neutral"))
+    
+    # Moving Average Analysis
+    price = last['close']
+    
+    if 'sma_20' in df.columns and not pd.isna(last.get('sma_20')):
+        if price > last['sma_20']:
+            buy_signals += 1
+            signal_details.append(("Price vs SMA20", f"₹{price:.2f}", "Above SMA20", "buy"))
+        else:
+            sell_signals += 1
+            signal_details.append(("Price vs SMA20", f"₹{price:.2f}", "Below SMA20", "sell"))
+    
+    if 'sma_50' in df.columns and not pd.isna(last.get('sma_50')):
+        if price > last['sma_50']:
+            buy_signals += 1
+            signal_details.append(("Price vs SMA50", f"₹{price:.2f}", "Above SMA50", "buy"))
+        else:
+            sell_signals += 1
+            signal_details.append(("Price vs SMA50", f"₹{price:.2f}", "Below SMA50", "sell"))
+    
+    # Golden/Death Cross
+    if 'sma_50' in df.columns and 'sma_200' in df.columns and len(df) > 2:
+        sma50_curr = last.get('sma_50')
+        sma200_curr = last.get('sma_200')
+        sma50_prev = df.iloc[-2].get('sma_50')
+        sma200_prev = df.iloc[-2].get('sma_200')
+        
+        if all(v is not None and not pd.isna(v) for v in [sma50_curr, sma200_curr, sma50_prev, sma200_prev]):
+            if sma50_curr > sma200_curr and sma50_prev <= sma200_prev:
+                buy_signals += 3
+                signal_details.append(("Golden Cross", "SMA50/200", "STRONG BUY SIGNAL", "buy"))
+            elif sma50_curr < sma200_curr and sma50_prev >= sma200_prev:
+                sell_signals += 3
+                signal_details.append(("Death Cross", "SMA50/200", "STRONG SELL SIGNAL", "sell"))
+    
+    # Bollinger Bands
+    if 'bb_upper' in df.columns and 'bb_lower' in df.columns:
+        bb_upper = last.get('bb_upper')
+        bb_lower = last.get('bb_lower')
+        
+        if bb_upper and bb_lower and not pd.isna(bb_upper) and not pd.isna(bb_lower):
+            if price <= bb_lower:
+                buy_signals += 2
+                signal_details.append(("Bollinger Bands", f"₹{price:.2f}", "At lower band - BUY", "buy"))
+            elif price >= bb_upper:
+                sell_signals += 2
+                signal_details.append(("Bollinger Bands", f"₹{price:.2f}", "At upper band - SELL", "sell"))
+            else:
+                neutral_signals += 1
+                signal_details.append(("Bollinger Bands", f"₹{price:.2f}", "Within bands", "neutral"))
+    
+    # Stochastic
+    if 'stoch_k' in df.columns and not pd.isna(last.get('stoch_k')):
+        stoch_k = last['stoch_k']
+        if stoch_k < 20:
+            buy_signals += 1
+            signal_details.append(("Stochastic", f"{stoch_k:.1f}", "Oversold", "buy"))
+        elif stoch_k > 80:
+            sell_signals += 1
+            signal_details.append(("Stochastic", f"{stoch_k:.1f}", "Overbought", "sell"))
+        else:
+            neutral_signals += 1
+            signal_details.append(("Stochastic", f"{stoch_k:.1f}", "Neutral", "neutral"))
+    
+    # Volume Analysis
+    if 'volume_ratio' in df.columns and not pd.isna(last.get('volume_ratio')):
+        vol_ratio = last['volume_ratio']
+        if vol_ratio > 1.5:
+            if last.get('price_change', 0) > 0:
+                buy_signals += 1
+                signal_details.append(("Volume", f"{vol_ratio:.2f}x avg", "High volume + price rise", "buy"))
+            else:
+                sell_signals += 1
+                signal_details.append(("Volume", f"{vol_ratio:.2f}x avg", "High volume + price fall", "sell"))
+    
+    # Overall Recommendation
+    total = buy_signals + sell_signals + neutral_signals
+    if total == 0:
+        recommendation = "HOLD"
+    else:
+        buy_pct = buy_signals / (buy_signals + sell_signals) if (buy_signals + sell_signals) > 0 else 0.5
+        
+        if buy_pct >= 0.7:
+            recommendation = "STRONG BUY"
+        elif buy_pct >= 0.55:
+            recommendation = "BUY"
+        elif buy_pct <= 0.3:
+            recommendation = "STRONG SELL"
+        elif buy_pct <= 0.45:
+            recommendation = "SELL"
+        else:
+            recommendation = "HOLD"
+    
+    return {
+        "recommendation": recommendation,
+        "buy_signals": buy_signals,
+        "sell_signals": sell_signals,
+        "neutral_signals": neutral_signals,
+        "signal_details": signal_details,
+        "buy_percentage": (buy_signals / (buy_signals + sell_signals) * 100) if (buy_signals + sell_signals) > 0 else 50,
+    }
+
+
+def format_large_number(num: float) -> str:
+    """Format large numbers to human readable (Cr, Lakh)"""
+    if num is None or num == 0:
+        return "N/A"
+    if num >= 1e12:
+        return f"₹{num/1e12:.2f}T"
+    elif num >= 1e7:
+        return f"₹{num/1e7:.2f}Cr"
+    elif num >= 1e5:
+        return f"₹{num/1e5:.2f}L"
+    else:
+        return f"₹{num:.2f}"
